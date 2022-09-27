@@ -1,0 +1,434 @@
+---
+title: "Product Analysis using R"
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+  html_notebook:
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+    number_sections: no
+    theme: lumen
+---    
+
+```{r library, message=FALSE, include=TRUE}
+# Libraries
+
+# Wrangling
+library(tidyverse)
+library(lubridate)
+library(scales)
+
+# Summary Statistics
+library(outliers)
+
+# Text Analysis
+library(stringr)        # text cleaning and regular expressions
+library(tidytext)       # provides additional text mining functions
+library(widyr)
+
+# Clustering
+library(factoextra)
+library(cluster)
+
+# Assoc Rules
+library("arules")
+library("arulesViz")
+
+# Plotting
+library(ggplot2)
+library(ggrepel)
+library(gridExtra)
+library(GGally)
+library(ggridges)
+library(kableExtra)
+library(wesanderson)
+
+# Mapping
+library(leaflet)
+library(sf)
+library(RColorBrewer)
+
+# Network Visualization
+library(igraph)
+library(ggraph)
+library(visNetwork)
+library(data.table)
+
+```
+
+```{r parameters, message=FALSE, include=TRUE}
+# Input Path
+file_orders <- here::here("03 data/orders.rds")
+file_products <- here::here("03 data/product.rds")
+file_customers <- here::here("03 data/customers_gender_zip_geocode.rds")
+file_co <- here::here("03 data/customers_gender_zip_geocode_orders.rds")
+file_zip_ph <- here::here("03 data/zip_ph.rds")
+
+# Read Files
+orders.raw <- read_rds(file_orders)
+products.raw <- read_rds(file_products)
+customers.raw <- read_rds(file_customers)
+co.raw <- read_rds(file_co)
+
+# Number Formatting
+options(scipen = 999)
+
+# Parameters
+# Irrelevant customer_ids
+xtest <- c("3273557147747", "3297613348963", "3436247875683", "3210539368547", 
+           "4412203910", "2236354953315")
+
+# Table Preferences for Kable
+tb.ops <- c("striped", "hover", "condensed", "responsive")
+
+```
+
+```{r message=FALSE, include=TRUE}
+# Customer Product Data 
+products.data <- 
+  products.raw %>% 
+  inner_join(orders.raw, by = c("order_number" = "order_number")) %>%
+  filter(order_year >= 2019) %>%
+  rename(customer_id = customer_id.x) %>%
+  mutate(has_value = if_else(item_value > 0, "has value", "zero value"),
+         has_customer = if_else(is.na(customer_id), "no customer id", "has customer id"))
+
+```
+
+
+### Product Analysis Overview
+
+&nbsp;  
+This analysis provides an overview of the website's product assortment focusing on specialty hair products. 
+
+Products were categorize according to
+  1. **price**  
+  2. **brand**  
+  3. **primary need** (e.g., coloring, thinning hair, or damaged hair)  
+  
+  **product type** (e.g., shampoo, conditioner, or treatment) could no be determined for 30% of the orders. As a result, it is excluded from the analysis.
+
+
+
+### Using text-analysis to categorize products
+The network diagram above shows the most common **product need** and **product type** for each brand, based on the descriptors used in the website. Each brand's respective websites were also consulted to confirm its positioning.
+
+```{r products.visnet.data, message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+# PART 3: Customers and Product Keywords
+
+# select correlation parameters
+cor.max = 1.1
+cor.min = 0.5
+count.min = 5
+
+#TF IDF Analysis
+words.data <- 
+   products.data %>%
+   select(product_id, product_features, item_value) %>%
+   filter(!is.na(product_features), !is.na(product_id)) %>% 
+   select(product_id, product_features) %>%
+   distinct() %>%
+   unnest_tokens(word, product_features)
+
+
+
+words.data <- 
+        words.data %>%
+        count(product_id, word, sort = TRUE) %>%
+        ungroup()
+
+words.data <- 
+    words.data %>%
+        bind_tf_idf(word, product_id, n)
+
+word.list <-
+  words.data %>%
+  group_by(product_id) %>%
+  arrange(desc(tf_idf)) %>%
+  mutate(word_rank = row_number()) %>%
+  filter(word_rank <= 2) %>%
+  ungroup() %>%
+  select(word) %>%
+  distinct()
+
+brand.list <-
+  products.data %>% select(product_brand1) %>% na.omit() %>% distinct() %>% pull(product_brand1)
+
+# format word.data
+words.data <- 
+  products.data %>%
+  select(product_features) %>% distinct() %>% mutate(id = row_number()) %>%
+  filter(!is.na(product_features)) %>%
+  unnest_tokens(word, product_features) %>%
+  inner_join(word.list) %>%
+  group_by(word) %>% filter(!word == "azta") %>%
+  filter(n() >= 10)  
+
+# transform words.data into a network list
+network.data <- 
+  words.data %>%
+  # pairwise_cor(word, customer_id, upper = FALSE) %>%
+  # filter(!is.na(correlation),
+  #        correlation < cor.max, 
+  #        correlation > cor.min)
+  ungroup() %>%
+  pairwise_count(word, id, upper = FALSE, sort = TRUE) %>% 
+  filter(!is.na(n),
+         #n < cor.max, 
+         n > count.min)
+
+## prepare node.size
+# node.size <-
+#   words.data %>%
+#   count("id" = word, wt = item_value/100000, name = "size")
+
+# Calculate degrees
+degree_value <- 
+  network.data %>%
+  graph_from_data_frame() %>%
+  degree()
+
+node.size <- 
+  degree_value %>% as_tibble(rownames = "id") %>% rename("size" = "value") %>%
+  mutate(size = if_else(id %in% brand.list, 5, size * 5))
+
+
+# VisNetwork: interactive network graph  
+vis.data <- 
+  network.data %>%
+  graph_from_data_frame() %>%
+  toVisNetworkData()
+
+# modify nodes and edges
+vis.data$nodes <- 
+  vis.data$nodes %>%
+  mutate(font.size = 200) %>%
+  inner_join(node.size, by = c("id" = "id"))
+
+
+# vis.data$edges <- vis.data$edges %>% mutate(width = correlation*10, length = 300/correlation)
+vis.data$edges <- vis.data$edges %>% 
+  mutate(length = case_when(from %in% brand.list ~ 10,
+                            to %in% brand.list ~ 10,
+                            TRUE ~0)) %>% 
+  filter(length > 0) %>%
+  filter(!(from %in% brand.list & to %in% brand.list))
+  #mutate(width = n/10,length = 10000/n)
+
+# complile graph
+
+vis <-
+  visNetwork(nodes = vis.data$nodes, edges = vis.data$edges) %>%
+  visPhysics(solver = "forceAtlas2Based",  
+             forceAtlas2Based = list(gravitationalConstant = -1000)) %>%
+  visLayout(randomSeed = 123) %>%
+  visOptions( highlightNearest = T )
+
+```
+
+```{r products.visnet, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+vis
+```
+
+
+The ridge plots show how certain product groups are typically priced higher, or lower than the average. It is also evident some product groups, such as *colored hair* and *L'oreal* occupy a wide range of price points. 
+
+```{r products.price.plot.data, message=FALSE, warning=FALSE, include=FALSE}
+## PLOT PREPARATION: PRODUCT PRICE ANALYSIS
+# geom_ridge 
+products.data2 <-
+products.data[rep(seq_along(products.data$item_qty), products.data$item_qty), ]
+
+# Brand Price Distribution
+p1 <-  
+  products.data2 %>%
+  filter(!is.na(product_brand1)) %>%
+  group_by(product_brand1) %>%
+  mutate(levels = median(item_price_net)) %>%
+  ggplot(aes(y = reorder(product_brand1,levels), 
+             x = item_price_net, 
+             alpha = 0.1, 
+             fill = levels)) +
+  # geom_boxplot() +
+  geom_density_ridges() +
+  scale_y_discrete(name = NULL) +
+  scale_x_log10(name = NULL,
+                n.breaks = 6,
+                labels = scales::dollar_format(prefix = "₱")) +
+  # scale_fill_discrete( name = NULL, guide = FALSE) +
+  scale_fill_gradientn(name = NULL, guide = FALSE, colours = wes_palette("Zissou1", n = 17, type = "continuous")) +
+  scale_size(guide = NULL) +
+  scale_alpha(guide = NULL) +
+  labs(title = "Price Distribution\nby Brand") +
+  theme(
+    plot.margin = unit(c(1,1.2,0.5,0.5),"cm"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8),
+    axis.text.x = element_text(angle = 45, hjust = 1))  
+
+# Need Price Distribution
+p2 <-  
+  products.data2 %>%
+  filter(!is.na(product_need1),!product_need1 %in% c("salon")) %>%
+  group_by(product_need1) %>%
+  mutate(levels = median(item_price_net)) %>%
+  ggplot(aes(y = reorder(product_need1,levels), 
+             x = item_price_net, 
+             alpha = 0.1, 
+             fill = levels)) +
+  # geom_boxplot() +
+  ggridges::geom_density_ridges() +
+  scale_y_discrete( name = NULL) +
+  scale_x_log10(name = NULL,
+                n.breaks = 6,
+                labels = scales::dollar_format(prefix = "₱")) +
+  scale_fill_gradientn(name = NULL, guide = FALSE, colours = wes_palette("Cavalcanti1", n = 17, type = "continuous")) +
+  scale_size(guide = NULL) +
+  scale_alpha(guide = NULL) +
+  labs(title = "Price Distribution\nby Primary Need") +
+  theme(
+    plot.margin = unit(c(1,1.2,0.5,0.5),"cm"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8),
+    axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# Type Price Distribution
+p3 <-  
+  products.data2 %>%
+  filter(!is.na(product_type1)) %>%
+  group_by(product_type1) %>%
+  mutate(levels = median(item_price_net)) %>%
+  ggplot(aes(y = reorder(product_type1,levels), 
+             x = item_price_net, 
+             alpha = 0.1, 
+             fill = product_type1)) +
+  ggridges::geom_density_ridges() +
+  scale_y_discrete( name = NULL) +
+  scale_x_log10(name = NULL,
+                n.breaks = 6,
+                labels = scales::dollar_format(prefix = "₱")) +
+  scale_fill_discrete( name = NULL, guide = FALSE) +
+  scale_size(guide = NULL) +
+  scale_alpha(guide = NULL) +
+  labs(title = "Price Distribution by Type") +
+  theme(
+    plot.margin = unit(c(1,1.2,0.5,0.5),"cm"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8),
+    axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r products.price.plot, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+## PRODUCT PRICE
+grid.arrange(p2, p1, ncol = 2, nrow = 1)
+```  
+
+Brands can also be plotted against sales volume and average price to determine their relative market position. In the chart below, size and opacity indicate the brand's share of total company revenue.
+
+```{r brand.sales.plot.data, echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+## PLOT PREPARATION: Brand Price Volume Analysis
+
+# Product x Customer Brand
+plot.data <- products.data %>%
+  filter(!is.na(product_brand1)) %>%
+  group_by(product_brand1, product_need1) %>%
+  summarise(item_value = sum(item_value),
+            item_sales = sum(item_qty)) %>%
+  group_by(product_brand1) %>%
+  mutate(ylevels = sum(item_value)) %>%
+  group_by(product_need1) %>%
+  mutate(xlevels = sum(item_value))
+
+p1 <-
+  plot.data %>%
+  group_by(product_brand1) %>%
+  summarise(item_value = sum(item_value),
+            item_sales = sum(item_sales)) %>%
+  mutate(avg_price = item_value / item_sales) %>%
+  ggplot(aes(y = avg_price,
+             x = item_sales,
+             # size = log(item_value),
+             ), 
+         ) +
+  geom_point(aes(size = item_value, color = "red")) +
+  geom_text_repel(aes(label = product_brand1, alpha = item_value)) +
+  scale_y_continuous(name = "Average Price\n", labels = comma) +
+  # scale_y_log10(name = "average price", labels = comma) +
+  scale_x_continuous(name = "Total Items" ,labels = comma, limits = c(-1000,12500)) +
+  # scale_x_log10(name = "items sold" ,labels = comma,  limits = c(1,1e5)) +
+  scale_color_discrete(guide = NULL) +
+  scale_size(guide = NULL) +
+  scale_alpha(guide = NULL) +
+  coord_cartesian(xlim = c(-1000,12500), ylim = c(0,4000)) +
+  labs(title = "Brand Sales \nby Volume and Price") +
+  theme(plot.margin = unit(c(1,1.2,0.5,0.5),"cm"),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r brand.sales.plot, echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+## PLOT: Brand Price Volume Analysis 1
+p1
+```
+
+
+Plotting the median line shows each each brand's impact on the portfolio. Davines has the highest volume, and sells at the average price. Kerastase, Nioxin and Olaplex are high-price products, but Keratase also sells high-volumes.  Meanwhile, L'oreal and Tigi sell similar volumes, but Tigi's selling price is below average.
+
+```{r brand.sales.plot2.data, echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+## PLOT: Brand Price Volume Analysis 2
+p2 <-
+  p1 + 
+  geom_hline(yintercept = 1710, color = "black", linetype = (1), alpha = 0.8) +
+  geom_rect(aes(xmin = -1000, xmax = 2500, ymin = 0, ymax = 2000), 
+            color = "red", alpha = 0, linetype = (3)) +
+  geom_rect(aes(xmin = -1000, xmax = 2500, ymin = 2200, ymax = 4000), 
+            color = "Dark Green", alpha = 0, linetype = (3)) +
+  geom_rect(aes(xmin = 6250, xmax = 8500, ymin = 2700, ymax = 4000), 
+            color = "blue", alpha = 0, linetype = (3)) +
+  geom_rect(aes(xmin = 9500, xmax = 11400, ymin = 1000, ymax = 2500), 
+            color = "purple", alpha = 0, linetype = (3)) + 
+  geom_rect(aes(xmin = 4100, xmax = 6400, ymin = 1800, ymax = 2100), 
+            color = "orange", alpha = 0, linetype = (3)) +
+  geom_rect(aes(xmin = 4100, xmax = 6400, ymin = 900, ymax = 1600), 
+            color = "brown", alpha = 0, linetype = (3))
+```
+
+```{r brand.sales.plot2, echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+p2
+```
+
+
+Plotting the brands against product needs shows how some top brands, such as Nioxin and Olaplex, are highly focused on specific needs, while Kerastase, davines, L'oreal, and TIGI cater to a wider set of needs.
+
+
+```{r brand.need.plot.data, message=FALSE, warning=FALSE, include=FALSE, paged.print=TRUE}
+## PLOT PREPARATION: Brand x Need Analysis
+p1 <-
+  plot.data %>% filter(!is.na(product_need1)) %>%
+  ggplot(aes(x = reorder(product_need1, desc(xlevels)),
+             y = reorder(product_brand1, ylevels),
+             color = product_need1, alpha = 0.2)) +
+  geom_point(aes(size = item_sales)) +
+  scale_x_discrete(name = NULL) +
+  scale_y_discrete(name = NULL) +
+  scale_color_discrete(guide = NULL) +
+  scale_size(guide = NULL) +
+  scale_alpha(guide = NULL) + 
+  labs(title = "Brand Sales \nby Customer Need") +
+  theme(plot.margin = unit(c(1,1.2,0.5,0.5),"cm"),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r brand.need.plot, echo=FALSE, fig.height=7, fig.width=6, message=FALSE, warning=FALSE, paged.print=FALSE}
+## PLOT: Brand x Need Strategy
+p1
+```
+
+
+
