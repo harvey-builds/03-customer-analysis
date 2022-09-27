@@ -1,2 +1,2 @@
-# Data science on produt and customer
-Analysis of customer base using R
+# Data science on product and customer data
+Product and customer analysis using R
